@@ -12,5 +12,6 @@ logs/
 outputs/predictions/
 outputs/comparisons/
 data/raw/*
+!data/raw/.gitkeep
 data/processed/
 checkpoints/
