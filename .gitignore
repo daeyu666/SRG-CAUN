@@ -11,6 +11,6 @@ __pycache__/
 logs/
 outputs/predictions/
 outputs/comparisons/
-data/raw/
+data/raw/*
 data/processed/
 checkpoints/
