@@ -65,6 +65,7 @@ class ReferenceDirectionLoss(nn.Module):
         stage_infos = aux.get("stage_infos", [])
         if not stage_infos:
             return next(model.parameters()).new_tensor(0.0)
+
         losses = []
         for info in stage_infos:
             ref = info.get("ref_residual", None)
@@ -74,13 +75,18 @@ class ReferenceDirectionLoss(nn.Module):
             shadow = 1.0 - reliability.detach()
             # 控制参考残差幅度，避免非阴影参考值被直接复制到阴影区域。
             losses.append(torch.mean(torch.abs(ref) * shadow))
+
         if not losses:
             return next(model.parameters()).new_tensor(0.0)
         return sum(losses) / len(losses)
 
 
 def parse_srg_args():
-    cfg = parse_args()
+    """解析 SRG-CAUN 自有参数和模板通用参数。
+
+    注意：先用 parse_known_args 取出 SRG-CAUN 参数，再把剩余参数交给 config.parse_args，
+    这样 --hidden_dim、--num_stages 等参数不会被基础配置解析器拒绝。
+    """
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--hidden_dim", type=int, default=48)
     parser.add_argument("--num_stages", type=int, default=3)
@@ -89,7 +95,12 @@ def parse_srg_args():
     parser.add_argument("--lambda_ref_dir", type=float, default=0.02)
     parser.add_argument("--score_sam_weight", type=float, default=1.0)
     parser.add_argument("--grad_clip", type=float, default=1.0)
-    args, _ = parser.parse_known_args()
+    parser.add_argument("--loss_schedule", type=str, default="warmup", choices=["warmup", "off"])
+    parser.add_argument("--phase1_epochs", type=int, default=50)
+    parser.add_argument("--phase2_epochs", type=int, default=150)
+    args, remaining = parser.parse_known_args()
+
+    cfg = parse_args(remaining)
     for key, value in vars(args).items():
         setattr(cfg, key, value)
     return cfg
@@ -114,6 +125,76 @@ def build_criterion(cfg, info):
     return base, shadow_sam, ref_dir
 
 
+def get_loss_weights(epoch: int, cfg) -> dict:
+    """分阶段损失权重。
+
+    warmup 默认策略：
+    1) 1 ~ phase1_epochs：只学稳定重建和基础光谱方向；
+    2) phase1_epochs+1 ~ phase2_epochs：加入轻量光谱形状约束；
+    3) phase2_epochs 以后：再打开阴影加权 SAM 和参考方向约束。
+    """
+    if getattr(cfg, "loss_schedule", "warmup") == "off":
+        return {
+            "l1": cfg.lambda_l1,
+            "sam": cfg.lambda_sam,
+            "dc": cfg.lambda_dc,
+            "sgrad": cfg.lambda_sgrad,
+            "sdir": cfg.lambda_sdir,
+            "ns_l1": cfg.lambda_ns_l1,
+            "srf_region": cfg.lambda_srf_region,
+            "shadow_sam": cfg.lambda_shadow_sam,
+            "ref_dir": cfg.lambda_ref_dir,
+        }
+
+    if epoch <= cfg.phase1_epochs:
+        return {
+            "l1": 1.0,
+            "sam": 0.05,
+            "dc": 0.10,
+            "sgrad": 0.0,
+            "sdir": 0.0,
+            "ns_l1": 0.30,
+            "srf_region": 0.0,
+            "shadow_sam": 0.0,
+            "ref_dir": 0.0,
+        }
+
+    if epoch <= cfg.phase2_epochs:
+        return {
+            "l1": 1.0,
+            "sam": 0.05,
+            "dc": 0.10,
+            "sgrad": 0.02,
+            "sdir": 0.05,
+            "ns_l1": 0.30,
+            "srf_region": 0.10,
+            "shadow_sam": 0.0,
+            "ref_dir": 0.0,
+        }
+
+    return {
+        "l1": 1.0,
+        "sam": 0.05,
+        "dc": 0.10,
+        "sgrad": 0.02,
+        "sdir": 0.05,
+        "ns_l1": 0.30,
+        "srf_region": 0.10,
+        "shadow_sam": 0.05,
+        "ref_dir": 0.01,
+    }
+
+
+def apply_base_loss_weights(base_loss: BaseHSRLoss, weights: dict):
+    base_loss.lambda_l1 = weights["l1"]
+    base_loss.lambda_sam = weights["sam"]
+    base_loss.lambda_dc = weights["dc"]
+    base_loss.lambda_sgrad = weights["sgrad"]
+    base_loss.lambda_sdir = weights["sdir"]
+    base_loss.lambda_ns_l1 = weights["ns_l1"]
+    base_loss.lambda_srf_region = weights["srf_region"]
+
+
 def calc_checkpoint_score(eval_metrics, cfg):
     """Best checkpoint 采用 PSNR 与 SAM 的加权分数，不再只看 PSNR。"""
     psnr = float(eval_metrics.get("PSNR", -1.0))
@@ -121,10 +202,13 @@ def calc_checkpoint_score(eval_metrics, cfg):
     return psnr - float(cfg.score_sam_weight) * sam
 
 
-def train_one_epoch(model, loader, optimizer, base_loss, shadow_sam_loss, ref_dir_loss, cfg, device):
+def train_one_epoch(model, loader, optimizer, base_loss, shadow_sam_loss, ref_dir_loss, cfg, device, epoch: int):
     model.train()
     meter = MetricAverager()
     total_loss = 0.0
+
+    loss_weights = get_loss_weights(epoch, cfg)
+    apply_base_loss_weights(base_loss, loss_weights)
 
     for batch in loader:
         batch = move_to_device(batch, device)
@@ -138,7 +222,7 @@ def train_one_epoch(model, loader, optimizer, base_loss, shadow_sam_loss, ref_di
 
         loss_shadow = shadow_sam_loss(pred, gt, aux.get("shadow_risk", None))
         loss_ref = ref_dir_loss(model)
-        loss = loss + cfg.lambda_shadow_sam * loss_shadow + cfg.lambda_ref_dir * loss_ref
+        loss = loss + loss_weights["shadow_sam"] * loss_shadow + loss_weights["ref_dir"] * loss_ref
 
         loss.backward()
         if cfg.grad_clip > 0:
@@ -153,6 +237,8 @@ def train_one_epoch(model, loader, optimizer, base_loss, shadow_sam_loss, ref_di
 
     avg = meter.average()
     avg["train_loss_total"] = total_loss / max(len(loader), 1)
+    for key, value in loss_weights.items():
+        avg[f"w_{key}"] = value
     return avg
 
 
@@ -217,26 +303,25 @@ def main():
     write_log(log_path, f"Model parameters: {count_parameters(model):.3f} M")
     write_log(log_path, f"Dataset info: {info}")
     write_log(log_path, f"Checkpoint score: PSNR - {cfg.score_sam_weight:.3f} * SAM")
-    write_log(
-        log_path,
-        "Loss weights: "
-        f"L1={cfg.lambda_l1}, SAM={cfg.lambda_sam}, DC={cfg.lambda_dc}, "
-        f"SGrad={cfg.lambda_sgrad}, SDir={cfg.lambda_sdir}, NS_L1={cfg.lambda_ns_l1}, "
-        f"SRFRegion={cfg.lambda_srf_region}, ShadowSAM={cfg.lambda_shadow_sam}, RefDir={cfg.lambda_ref_dir}",
-    )
+    write_log(log_path, f"Loss schedule: {cfg.loss_schedule}, phase1={cfg.phase1_epochs}, phase2={cfg.phase2_epochs}")
+    write_log(log_path, "Phase1 loss: L1=1.0, SAM=0.05, DC=0.10, NS_L1=0.30; others=0")
+    write_log(log_path, "Phase2 loss: +SGrad=0.02, SDir=0.05, SRFRegion=0.10")
+    write_log(log_path, "Phase3 loss: +ShadowSAM=0.05, RefDir=0.01")
 
     csv_logger = CSVLogger(
         csv_path,
         fieldnames=[
             "epoch", "train_loss_total", "loss", "l1", "sam", "dc", "sgrad", "sdir", "ns_l1", "srf_region",
-            "shadow_sam", "ref_dir", "PSNR", "RMSE", "SAM", "ERGAS", "SSIM", "CC",
+            "shadow_sam", "ref_dir",
+            "w_l1", "w_sam", "w_dc", "w_sgrad", "w_sdir", "w_ns_l1", "w_srf_region", "w_shadow_sam", "w_ref_dir",
+            "PSNR", "RMSE", "SAM", "ERGAS", "SSIM", "CC",
             "checkpoint_score", "best_score", "best_psnr", "best_sam",
         ],
     )
 
     for epoch in range(start_epoch, cfg.epochs + 1):
         train_metrics = train_one_epoch(
-            model, train_loader, optimizer, base_loss, shadow_sam_loss, ref_dir_loss, cfg, device
+            model, train_loader, optimizer, base_loss, shadow_sam_loss, ref_dir_loss, cfg, device, epoch
         )
 
         eval_metrics = {}
@@ -263,6 +348,7 @@ def main():
                         "best_psnr": best_psnr,
                         "best_sam": best_sam,
                         "score_formula": f"PSNR - {cfg.score_sam_weight} * SAM",
+                        "loss_weights": get_loss_weights(epoch, cfg),
                     },
                 )
 
@@ -280,10 +366,16 @@ def main():
                     "best_psnr": best_psnr,
                     "best_sam": best_sam,
                     "score_formula": f"PSNR - {cfg.score_sam_weight} * SAM",
+                    "loss_weights": get_loss_weights(epoch, cfg),
                 },
             )
 
         msg = f"Epoch {epoch:04d}/{cfg.epochs} | train_loss={train_metrics['train_loss_total']:.6f}"
+        msg += (
+            f" | w: L1={train_metrics['w_l1']:.2f}, SAM={train_metrics['w_sam']:.2f}, "
+            f"DC={train_metrics['w_dc']:.2f}, NS={train_metrics['w_ns_l1']:.2f}, "
+            f"ShSAM={train_metrics['w_shadow_sam']:.2f}"
+        )
         if eval_metrics:
             msg += (
                 f" | PSNR={eval_metrics['PSNR']:.4f} SAM={eval_metrics['SAM']:.4f} "
@@ -316,6 +408,7 @@ def main():
             "best_psnr": best_psnr,
             "best_sam": best_sam,
             "score_formula": f"PSNR - {cfg.score_sam_weight} * SAM",
+            "loss_weights": get_loss_weights(cfg.epochs, cfg),
         },
     )
     write_log(
