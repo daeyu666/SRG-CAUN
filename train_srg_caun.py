@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import os
-from typing import Dict, Tuple
 
 import torch
 import torch.nn as nn
@@ -13,7 +12,7 @@ from torch.optim import AdamW
 
 from config import parse_args, print_config
 from data_loader import build_loaders
-from losses import BaseHSRLoss, SAMLoss
+from losses import BaseHSRLoss
 from metrics import MetricAverager, calc_metrics
 from models import build_srg_caun
 from utils import (
@@ -88,6 +87,7 @@ def parse_srg_args():
     parser.add_argument("--ref_topk", type=int, default=4)
     parser.add_argument("--lambda_shadow_sam", type=float, default=0.10)
     parser.add_argument("--lambda_ref_dir", type=float, default=0.02)
+    parser.add_argument("--score_sam_weight", type=float, default=1.0)
     parser.add_argument("--grad_clip", type=float, default=1.0)
     args, _ = parser.parse_known_args()
     for key, value in vars(args).items():
@@ -112,6 +112,13 @@ def build_criterion(cfg, info):
     shadow_sam = ShadowWeightedSAMLoss(weight_scale=2.0)
     ref_dir = ReferenceDirectionLoss()
     return base, shadow_sam, ref_dir
+
+
+def calc_checkpoint_score(eval_metrics, cfg):
+    """Best checkpoint 采用 PSNR 与 SAM 的加权分数，不再只看 PSNR。"""
+    psnr = float(eval_metrics.get("PSNR", -1.0))
+    sam = float(eval_metrics.get("SAM", 1e6))
+    return psnr - float(cfg.score_sam_weight) * sam
 
 
 def train_one_epoch(model, loader, optimizer, base_loss, shadow_sam_loss, ref_dir_loss, cfg, device):
@@ -193,9 +200,11 @@ def main():
     csv_path = os.path.join(cfg.log_root, f"{cfg.dataset}_srg_caun.csv")
 
     start_epoch = 1
+    best_score = -1e9
     best_psnr = -1.0
+    best_sam = 1e9
     if cfg.resume:
-        start_epoch, best_psnr = load_checkpoint(
+        start_epoch, best_score = load_checkpoint(
             model,
             cfg.resume,
             optimizer=optimizer,
@@ -207,12 +216,21 @@ def main():
 
     write_log(log_path, f"Model parameters: {count_parameters(model):.3f} M")
     write_log(log_path, f"Dataset info: {info}")
+    write_log(log_path, f"Checkpoint score: PSNR - {cfg.score_sam_weight:.3f} * SAM")
+    write_log(
+        log_path,
+        "Loss weights: "
+        f"L1={cfg.lambda_l1}, SAM={cfg.lambda_sam}, DC={cfg.lambda_dc}, "
+        f"SGrad={cfg.lambda_sgrad}, SDir={cfg.lambda_sdir}, NS_L1={cfg.lambda_ns_l1}, "
+        f"SRFRegion={cfg.lambda_srf_region}, ShadowSAM={cfg.lambda_shadow_sam}, RefDir={cfg.lambda_ref_dir}",
+    )
 
     csv_logger = CSVLogger(
         csv_path,
         fieldnames=[
             "epoch", "train_loss_total", "loss", "l1", "sam", "dc", "sgrad", "sdir", "ns_l1", "srf_region",
-            "shadow_sam", "ref_dir", "PSNR", "RMSE", "SAM", "ERGAS", "SSIM", "CC", "best_psnr",
+            "shadow_sam", "ref_dir", "PSNR", "RMSE", "SAM", "ERGAS", "SSIM", "CC",
+            "checkpoint_score", "best_score", "best_psnr", "best_sam",
         ],
     )
 
@@ -222,26 +240,89 @@ def main():
         )
 
         eval_metrics = {}
+        checkpoint_score = ""
         if epoch % cfg.eval_interval == 0:
             eval_metrics = evaluate(model, test_loader, cfg, device)
+            checkpoint_score = calc_checkpoint_score(eval_metrics, cfg)
             psnr = eval_metrics.get("PSNR", -1.0)
-            if psnr > best_psnr:
+            sam = eval_metrics.get("SAM", 1e9)
+            if checkpoint_score > best_score:
+                best_score = checkpoint_score
                 best_psnr = psnr
-                save_checkpoint(model, optimizer, epoch, best_psnr, best_path, extra={"cfg": cfg.__dict__, "info": info})
+                best_sam = sam
+                save_checkpoint(
+                    model,
+                    optimizer,
+                    epoch,
+                    best_score,
+                    best_path,
+                    extra={
+                        "cfg": cfg.__dict__,
+                        "info": info,
+                        "best_score": best_score,
+                        "best_psnr": best_psnr,
+                        "best_sam": best_sam,
+                        "score_formula": f"PSNR - {cfg.score_sam_weight} * SAM",
+                    },
+                )
 
         if epoch % cfg.save_interval == 0:
-            save_checkpoint(model, optimizer, epoch, best_psnr, ckpt_path, extra={"cfg": cfg.__dict__, "info": info})
+            save_checkpoint(
+                model,
+                optimizer,
+                epoch,
+                best_score,
+                ckpt_path,
+                extra={
+                    "cfg": cfg.__dict__,
+                    "info": info,
+                    "best_score": best_score,
+                    "best_psnr": best_psnr,
+                    "best_sam": best_sam,
+                    "score_formula": f"PSNR - {cfg.score_sam_weight} * SAM",
+                },
+            )
 
         msg = f"Epoch {epoch:04d}/{cfg.epochs} | train_loss={train_metrics['train_loss_total']:.6f}"
         if eval_metrics:
-            msg += f" | PSNR={eval_metrics['PSNR']:.4f} SAM={eval_metrics['SAM']:.4f} best={best_psnr:.4f}"
+            msg += (
+                f" | PSNR={eval_metrics['PSNR']:.4f} SAM={eval_metrics['SAM']:.4f} "
+                f"score={checkpoint_score:.4f} best_score={best_score:.4f} "
+                f"best_psnr={best_psnr:.4f} best_sam={best_sam:.4f}"
+            )
         write_log(log_path, msg)
 
-        row = {"epoch": epoch, **train_metrics, **eval_metrics, "best_psnr": best_psnr}
+        row = {
+            "epoch": epoch,
+            **train_metrics,
+            **eval_metrics,
+            "checkpoint_score": checkpoint_score,
+            "best_score": best_score,
+            "best_psnr": best_psnr,
+            "best_sam": best_sam,
+        }
         csv_logger.write(row)
 
-    save_checkpoint(model, optimizer, cfg.epochs, best_psnr, ckpt_path, extra={"cfg": cfg.__dict__, "info": info})
-    write_log(log_path, f"Training finished. Best PSNR={best_psnr:.4f}. Best checkpoint: {best_path}")
+    save_checkpoint(
+        model,
+        optimizer,
+        cfg.epochs,
+        best_score,
+        ckpt_path,
+        extra={
+            "cfg": cfg.__dict__,
+            "info": info,
+            "best_score": best_score,
+            "best_psnr": best_psnr,
+            "best_sam": best_sam,
+            "score_formula": f"PSNR - {cfg.score_sam_weight} * SAM",
+        },
+    )
+    write_log(
+        log_path,
+        f"Training finished. Best score={best_score:.4f}, best PSNR={best_psnr:.4f}, "
+        f"best SAM={best_sam:.4f}. Best checkpoint: {best_path}",
+    )
 
 
 if __name__ == "__main__":
