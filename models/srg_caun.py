@@ -116,7 +116,12 @@ class InitialReconstruction(nn.Module):
 
 
 class ShadowReliabilityEstimator(nn.Module):
-    """输出连续可靠性图。数值越大表示越可信、越接近非阴影。"""
+    """输出连续可靠性图。数值越大表示越可信、越接近非阴影。
+
+    之前只依赖一个无监督 sigmoid 分支，容易整体输出高可靠，导致 model_risk 阴影像素为 0。
+    这里加入确定性的低反射率先验：光谱模长越低、MSI 亮度越低，可靠性先验越低。
+    最终可靠性 = 0.35 * 学习可靠性 + 0.65 * 低反射率先验可靠性。
+    """
 
     def __init__(self, n_bands: int, n_msi_bands: int, hidden_dim: int):
         super().__init__()
@@ -138,22 +143,39 @@ class ShadowReliabilityEstimator(nn.Module):
         gy = F.pad(gy, (0, 0, 0, 1))
         return gx + gy
 
+    @staticmethod
+    def _minmax_norm(x: torch.Tensor) -> torch.Tensor:
+        x_min = x.amin(dim=(2, 3), keepdim=True)
+        x_max = x.amax(dim=(2, 3), keepdim=True)
+        return (x - x_min) / (x_max - x_min).clamp_min(1e-6)
+
     def forward(self, z: torch.Tensor, hr_msi: torch.Tensor, lr_residual: torch.Tensor, msi_residual: torch.Tensor) -> Dict[str, torch.Tensor]:
         spectral_norm = torch.sqrt(torch.sum(z * z, dim=1, keepdim=True) + 1e-8)
-        spectral_norm = spectral_norm / spectral_norm.amax(dim=(2, 3), keepdim=True).clamp_min(1e-6)
+        spectral_norm = self._minmax_norm(spectral_norm)
+
         msi_intensity = hr_msi.mean(dim=1, keepdim=True)
-        msi_intensity = msi_intensity / msi_intensity.amax(dim=(2, 3), keepdim=True).clamp_min(1e-6)
+        msi_intensity = self._minmax_norm(msi_intensity)
+
         lr_res = torch.mean(torch.abs(lr_residual), dim=1, keepdim=True)
         msi_res = torch.mean(torch.abs(msi_residual), dim=1, keepdim=True)
         local_grad = self._gradient_mag(msi_intensity)
         x = torch.cat([z, hr_msi, spectral_norm, msi_intensity, lr_res + msi_res, local_grad], dim=1)
         out = torch.sigmoid(self.net(x))
-        reliability = out[:, 0:1]
+
+        learned_reliability = out[:, 0:1]
+        # 低反射率先验：不把所有暗像素硬判为阴影，但给低模长、低 MSI 亮度区域明确更高风险。
+        prior_reliability = torch.clamp(0.60 * spectral_norm + 0.40 * msi_intensity, 0.0, 1.0)
+        reliability = torch.clamp(0.35 * learned_reliability + 0.65 * prior_reliability, 0.0, 1.0)
+        shadow_risk = 1.0 - reliability
+
         return {
             "reliability": reliability,
-            "shadow_risk": 1.0 - reliability,
+            "shadow_risk": shadow_risk,
+            "learned_reliability": learned_reliability,
+            "prior_reliability": prior_reliability,
+            "prior_shadow_risk": 1.0 - prior_reliability,
             "boundary": out[:, 1:2],
-            "low_reflectance_risk": out[:, 2:3],
+            "low_reflectance_risk": torch.clamp(1.0 - prior_reliability, 0.0, 1.0),
         }
 
 
@@ -246,7 +268,7 @@ class NonShadowReferenceBank(nn.Module):
         spec_diff = self._spectral_diff(spec_dir)
         value_map = self.value_encoder(torch.cat([spec_dir, spec_diff], dim=1))
         v = value_map.flatten(2).transpose(1, 2)
-        ref_mask = (rel_s.flatten(2) > 0.55).float()
+        ref_mask = (rel_s.flatten(2) > 0.60).float()
         shadow_query_mask = (1.0 - rel_s).flatten(2).transpose(1, 2)
         sim = torch.bmm(q, k.transpose(1, 2)).masked_fill(ref_mask <= 0.0, -1e4)
         k_eff = min(self.topk, sim.shape[-1])
@@ -398,6 +420,9 @@ class SRGCAUN(nn.Module):
             "msi_raw": msi_raw.detach(),
             "reliability": reliability.detach(),
             "shadow_risk": (1.0 - reliability).detach(),
+            "learned_reliability": reliability_info.get("learned_reliability", reliability).detach(),
+            "prior_reliability": reliability_info.get("prior_reliability", reliability).detach(),
+            "prior_shadow_risk": reliability_info.get("prior_shadow_risk", 1.0 - reliability).detach(),
             "stage_infos": stage_infos,
         }
         self.latest_aux = aux
