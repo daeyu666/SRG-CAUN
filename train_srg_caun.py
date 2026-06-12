@@ -126,13 +126,7 @@ def build_criterion(cfg, info):
 
 
 def get_loss_weights(epoch: int, cfg) -> dict:
-    """分阶段损失权重。
-
-    warmup 默认策略：
-    1) 1 ~ phase1_epochs：只学稳定重建和基础光谱方向；
-    2) phase1_epochs+1 ~ phase2_epochs：加入轻量光谱形状约束；
-    3) phase2_epochs 以后：再打开阴影加权 SAM 和参考方向约束。
-    """
+    """分阶段损失权重。"""
     if getattr(cfg, "loss_schedule", "warmup") == "off":
         return {
             "l1": cfg.lambda_l1,
@@ -378,7 +372,9 @@ def main():
         )
         if eval_metrics:
             msg += (
-                f" | PSNR={eval_metrics['PSNR']:.4f} SAM={eval_metrics['SAM']:.4f} "
+                f" | PSNR={eval_metrics['PSNR']:.4f} RMSE={eval_metrics['RMSE']:.6f} "
+                f"SAM={eval_metrics['SAM']:.4f} ERGAS={eval_metrics['ERGAS']:.4f} "
+                f"SSIM={eval_metrics['SSIM']:.4f} CC={eval_metrics['CC']:.4f} "
                 f"score={checkpoint_score:.4f} best_score={best_score:.4f} "
                 f"best_psnr={best_psnr:.4f} best_sam={best_sam:.4f}"
             )
