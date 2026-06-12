@@ -62,6 +62,26 @@ def move_to_device(batch: Dict, device: torch.device) -> Dict:
     return out
 
 
+def _to_checkpoint_safe(obj):
+    """将 extra 中的自定义配置对象转成基础 Python 类型。
+
+    PyTorch 2.6 以后 torch.load 默认更偏向 weights_only 安全加载，
+    如果 checkpoint 里保存了 DatasetConfig 等自定义对象，可能触发反序列化限制。
+    这里在保存端尽量把 extra 转成 dict/list/str/int/float/bool/None/Tensor。
+    """
+    if obj is None or isinstance(obj, (str, int, float, bool)):
+        return obj
+    if torch.is_tensor(obj):
+        return obj
+    if isinstance(obj, dict):
+        return {str(k): _to_checkpoint_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_to_checkpoint_safe(v) for v in obj]
+    if hasattr(obj, "__dict__"):
+        return _to_checkpoint_safe(vars(obj))
+    return str(obj)
+
+
 def save_checkpoint(
     model: torch.nn.Module,
     optimizer: Optional[torch.optim.Optimizer],
@@ -82,7 +102,7 @@ def save_checkpoint(
         state["optimizer"] = optimizer.state_dict()
 
     if extra is not None:
-        state["extra"] = extra
+        state["extra"] = _to_checkpoint_safe(extra)
 
     torch.save(state, path)
 
@@ -98,7 +118,14 @@ def load_checkpoint(
     if not os.path.exists(path):
         raise FileNotFoundError(f"Checkpoint not found: {path}")
 
-    state = torch.load(path, map_location=map_location)
+    # PyTorch 2.6 起部分环境下 torch.load 默认使用 weights_only=True，
+    # 旧 checkpoint 中若包含 DatasetConfig 等自定义对象会报 Unsupported global。
+    # 本项目加载的是自己训练保存的本地 checkpoint，设置 weights_only=False 可以兼容旧文件。
+    try:
+        state = torch.load(path, map_location=map_location, weights_only=False)
+    except TypeError:
+        # 兼容较老版本 PyTorch，没有 weights_only 参数。
+        state = torch.load(path, map_location=map_location)
 
     if "model" in state:
         missing_keys, unexpected_keys = model.load_state_dict(state["model"], strict=strict)
@@ -160,6 +187,7 @@ def write_log(log_path: str, text: str, print_text: bool = True):
 
     with open(log_path, "a", encoding="utf-8") as f:
         f.write(line + "\n")
+
 
 class CSVLogger:
     """
