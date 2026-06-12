@@ -2,11 +2,13 @@
 """Analyze shadow / non-shadow reconstruction quality for SRG-CAUN.
 
 该脚本用于判断模型是否真正降低了阴影区域 SAM。
-它支持两种阴影划分方式：
+支持三种阴影划分方式：
 1. gt_norm：根据 GT-HSI 光谱模长的低分位生成阴影/低反射率掩膜；
-2. model_risk：根据模型输出的 shadow_risk 生成阴影风险掩膜。
+2. model_risk：根据模型输出的 shadow_risk 阈值生成阴影风险掩膜；
+3. model_risk_percentile：根据模型 shadow_risk 最高分位生成阴影风险掩膜。
 
 建议优先看 gt_norm，因为它不依赖模型自身预测的可靠性图，更适合做客观对比。
+model_risk_percentile 用于检查可靠图排序是否合理，避免固定阈值导致 shadow pixels 为 0。
 """
 
 from __future__ import annotations
@@ -17,7 +19,6 @@ import os
 from typing import Dict, List
 
 import torch
-import torch.nn.functional as F
 
 from config import parse_args, print_config
 from data_loader import build_loaders
@@ -31,7 +32,12 @@ def parse_shadow_args():
     parser.add_argument("--hidden_dim", type=int, default=48)
     parser.add_argument("--num_stages", type=int, default=3)
     parser.add_argument("--ref_topk", type=int, default=4)
-    parser.add_argument("--mask_mode", type=str, default="gt_norm", choices=["gt_norm", "model_risk"])
+    parser.add_argument(
+        "--mask_mode",
+        type=str,
+        default="gt_norm",
+        choices=["gt_norm", "model_risk", "model_risk_percentile"],
+    )
     parser.add_argument("--shadow_percentile", type=float, default=20.0)
     parser.add_argument("--risk_threshold", type=float, default=0.50)
     parser.add_argument("--save_csv", type=str, default="")
@@ -73,13 +79,18 @@ def calc_masked_metrics(pred: torch.Tensor, gt: torch.Tensor, mask: torch.Tensor
 def make_gt_norm_shadow_mask(gt: torch.Tensor, percentile: float) -> torch.Tensor:
     """根据 GT 光谱模长低分位划分阴影/低反射率区域。"""
     norm = torch.sqrt(torch.sum(gt * gt, dim=1, keepdim=True) + 1e-8)
-    flat = norm.flatten()
-    q = torch.quantile(flat, percentile / 100.0)
+    q = torch.quantile(norm.flatten(), percentile / 100.0)
     return norm <= q
 
 
 def make_model_risk_shadow_mask(shadow_risk: torch.Tensor, threshold: float) -> torch.Tensor:
     return shadow_risk >= threshold
+
+
+def make_model_risk_percentile_mask(shadow_risk: torch.Tensor, percentile: float) -> torch.Tensor:
+    """取 shadow_risk 最高 percentile% 的像素作为模型可靠图判断的阴影风险区域。"""
+    q = torch.quantile(shadow_risk.flatten(), 1.0 - percentile / 100.0)
+    return shadow_risk >= q
 
 
 def average_metric_dicts(rows: List[Dict[str, float]]) -> Dict[str, float]:
@@ -96,6 +107,20 @@ def average_metric_dicts(rows: List[Dict[str, float]]) -> Dict[str, float]:
         else:
             out[key] = float(sum(values) / len(values))
     return out
+
+
+def risk_stats(shadow_risk: torch.Tensor) -> Dict[str, float]:
+    flat = shadow_risk.flatten()
+    return {
+        "risk_min": float(flat.min().item()),
+        "risk_mean": float(flat.mean().item()),
+        "risk_max": float(flat.max().item()),
+        "risk_p80": float(torch.quantile(flat, 0.80).item()),
+        "risk_p90": float(torch.quantile(flat, 0.90).item()),
+        "risk_p95": float(torch.quantile(flat, 0.95).item()),
+        "risk_ge_03": float((flat >= 0.30).float().mean().item()),
+        "risk_ge_05": float((flat >= 0.50).float().mean().item()),
+    }
 
 
 @torch.no_grad()
@@ -131,6 +156,7 @@ def main():
 
     all_rows = []
     region_buckets = {"all": [], "shadow": [], "non_shadow": []}
+    risk_stat_rows = []
 
     for sample_idx, batch in enumerate(test_loader):
         batch = move_to_device(batch, device)
@@ -140,11 +166,17 @@ def main():
 
         pred, aux = model(lr_hsi, hr_msi, return_aux=True)
         pred = torch.clamp(pred, 0.0, 1.0)
+        shadow_risk = aux["shadow_risk"]
+        rs = risk_stats(shadow_risk)
+        rs["sample_idx"] = sample_idx
+        risk_stat_rows.append(rs)
 
         if cfg.mask_mode == "gt_norm":
             shadow_mask = make_gt_norm_shadow_mask(gt, cfg.shadow_percentile)
+        elif cfg.mask_mode == "model_risk":
+            shadow_mask = make_model_risk_shadow_mask(shadow_risk, cfg.risk_threshold)
         else:
-            shadow_mask = make_model_risk_shadow_mask(aux["shadow_risk"], cfg.risk_threshold)
+            shadow_mask = make_model_risk_percentile_mask(shadow_risk, cfg.shadow_percentile)
 
         non_shadow_mask = ~shadow_mask
         all_mask = torch.ones_like(shadow_mask, dtype=torch.bool)
@@ -167,6 +199,8 @@ def main():
             all_rows.append(metrics)
             region_buckets[region_name].append(metrics)
 
+    risk_avg = average_metric_dicts(risk_stat_rows)
+
     print("=" * 80)
     print("Shadow Region Analysis")
     print("=" * 80)
@@ -175,8 +209,16 @@ def main():
     print(f"Mask mode: {cfg.mask_mode}")
     if cfg.mask_mode == "gt_norm":
         print(f"Shadow mask: lowest {cfg.shadow_percentile:.1f}% GT spectral norm pixels")
-    else:
+    elif cfg.mask_mode == "model_risk":
         print(f"Shadow mask: model shadow_risk >= {cfg.risk_threshold:.3f}")
+    else:
+        print(f"Shadow mask: top {cfg.shadow_percentile:.1f}% model shadow_risk pixels")
+    print("-" * 80)
+    print("Model shadow_risk statistics")
+    print(f"  min / mean / max : {risk_avg['risk_min']:.4f} / {risk_avg['risk_mean']:.4f} / {risk_avg['risk_max']:.4f}")
+    print(f"  p80 / p90 / p95  : {risk_avg['risk_p80']:.4f} / {risk_avg['risk_p90']:.4f} / {risk_avg['risk_p95']:.4f}")
+    print(f"  ratio >= 0.30    : {risk_avg['risk_ge_03'] * 100:.2f}%")
+    print(f"  ratio >= 0.50    : {risk_avg['risk_ge_05'] * 100:.2f}%")
     print("-" * 80)
 
     summary_rows = []
@@ -219,8 +261,17 @@ def main():
         for row in summary_rows:
             writer.writerow({key: row.get(key, "") for key in summary_fieldnames})
 
+    risk_path = save_path.replace(".csv", "_risk_stats.csv")
+    risk_fieldnames = ["sample_idx", "risk_min", "risk_mean", "risk_max", "risk_p80", "risk_p90", "risk_p95", "risk_ge_03", "risk_ge_05"]
+    with open(risk_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=risk_fieldnames)
+        writer.writeheader()
+        for row in risk_stat_rows:
+            writer.writerow({key: row.get(key, "") for key in risk_fieldnames})
+
     print(f"Saved detail CSV: {save_path}")
     print(f"Saved summary CSV: {summary_path}")
+    print(f"Saved risk stats CSV: {risk_path}")
     print("=" * 80)
 
 
