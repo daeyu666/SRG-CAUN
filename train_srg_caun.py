@@ -73,7 +73,6 @@ class ReferenceDirectionLoss(nn.Module):
             if ref is None or reliability is None:
                 continue
             shadow = 1.0 - reliability.detach()
-            # 控制参考残差幅度，避免非阴影参考值被直接复制到阴影区域。
             losses.append(torch.mean(torch.abs(ref) * shadow))
 
         if not losses:
@@ -82,17 +81,15 @@ class ReferenceDirectionLoss(nn.Module):
 
 
 def parse_srg_args():
-    """解析 SRG-CAUN 自有参数和模板通用参数。
-
-    注意：先用 parse_known_args 取出 SRG-CAUN 参数，再把剩余参数交给 config.parse_args，
-    这样 --hidden_dim、--num_stages 等参数不会被基础配置解析器拒绝。
-    """
+    """解析 SRG-CAUN 自有参数和模板通用参数。"""
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--hidden_dim", type=int, default=48)
     parser.add_argument("--num_stages", type=int, default=3)
     parser.add_argument("--ref_topk", type=int, default=4)
     parser.add_argument("--lambda_shadow_sam", type=float, default=0.10)
     parser.add_argument("--lambda_ref_dir", type=float, default=0.02)
+    parser.add_argument("--lambda_stage_loss", type=float, default=1.0,
+                        help="Weight for averaged losses on every stage z_next output.")
     parser.add_argument("--score_sam_weight", type=float, default=1.0)
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--loss_schedule", type=str, default="warmup", choices=["warmup", "off"])
@@ -196,6 +193,12 @@ def calc_checkpoint_score(eval_metrics, cfg):
     return psnr - float(cfg.score_sam_weight) * sam
 
 
+def average_tensors(values, fallback: torch.Tensor) -> torch.Tensor:
+    if not values:
+        return fallback
+    return sum(values) / len(values)
+
+
 def train_one_epoch(model, loader, optimizer, base_loss, shadow_sam_loss, ref_dir_loss, cfg, device, epoch: int):
     model.train()
     meter = MetricAverager()
@@ -212,11 +215,29 @@ def train_one_epoch(model, loader, optimizer, base_loss, shadow_sam_loss, ref_di
 
         optimizer.zero_grad(set_to_none=True)
         pred, aux = model(lr_hsi, hr_msi, return_aux=True)
-        loss, loss_dict = base_loss(pred, gt, lr_hsi, hr_msi)
+        loss_final, loss_dict = base_loss(pred, gt, lr_hsi, hr_msi)
 
+        zero = pred.new_tensor(0.0)
+        stage_outputs = aux.get("stage_outputs", [])
+        stage_base_losses = []
+        stage_shadow_losses = []
+        for stage_pred in stage_outputs:
+            stage_loss, _ = base_loss(stage_pred, gt, lr_hsi, hr_msi)
+            stage_base_losses.append(stage_loss)
+            stage_shadow_losses.append(shadow_sam_loss(stage_pred, gt, aux.get("shadow_risk", None)))
+
+        loss_stage = average_tensors(stage_base_losses, zero)
+        loss_stage_shadow = average_tensors(stage_shadow_losses, zero)
         loss_shadow = shadow_sam_loss(pred, gt, aux.get("shadow_risk", None))
         loss_ref = ref_dir_loss(model)
-        loss = loss + loss_weights["shadow_sam"] * loss_shadow + loss_weights["ref_dir"] * loss_ref
+
+        stage_weight = float(getattr(cfg, "lambda_stage_loss", 1.0))
+        loss = (
+            loss_final
+            + stage_weight * loss_stage
+            + loss_weights["shadow_sam"] * (loss_shadow + stage_weight * loss_stage_shadow)
+            + loss_weights["ref_dir"] * loss_ref
+        )
 
         loss.backward()
         if cfg.grad_clip > 0:
@@ -225,14 +246,18 @@ def train_one_epoch(model, loader, optimizer, base_loss, shadow_sam_loss, ref_di
 
         total_loss += float(loss.item())
         metrics = {k: float(v.item()) for k, v in loss_dict.items()}
+        metrics["stage_loss"] = float(loss_stage.detach().item())
+        metrics["stage_shadow_sam"] = float(loss_stage_shadow.detach().item())
         metrics["shadow_sam"] = float(loss_shadow.detach().item())
         metrics["ref_dir"] = float(loss_ref.detach().item())
+        metrics["stage_count"] = float(len(stage_outputs))
         meter.update(metrics)
 
     avg = meter.average()
     avg["train_loss_total"] = total_loss / max(len(loader), 1)
     for key, value in loss_weights.items():
         avg[f"w_{key}"] = value
+    avg["w_stage_loss"] = float(getattr(cfg, "lambda_stage_loss", 1.0))
     return avg
 
 
@@ -298,6 +323,8 @@ def main():
     write_log(log_path, f"Dataset info: {info}")
     write_log(log_path, f"Checkpoint score: PSNR - {cfg.score_sam_weight:.3f} * SAM")
     write_log(log_path, f"Loss schedule: {cfg.loss_schedule}, phase1={cfg.phase1_epochs}, phase2={cfg.phase2_epochs}")
+    write_log(log_path, f"Stage deep supervision: lambda_stage_loss={cfg.lambda_stage_loss:.3f}")
+    write_log(log_path, "Initial reconstruction: LR-HSI bicubic upsample only; HR-MSI is not injected in init.")
     write_log(log_path, "Phase1 loss: L1=1.0, SAM=0.05, DC=0.10, NS_L1=0.30; others=0")
     write_log(log_path, "Phase2 loss: +SGrad=0.02, SDir=0.05, SRFRegion=0.10")
     write_log(log_path, "Phase3 loss: +ShadowSAM=0.05, RefDir=0.01")
@@ -305,9 +332,10 @@ def main():
     csv_logger = CSVLogger(
         csv_path,
         fieldnames=[
-            "epoch", "train_loss_total", "loss", "l1", "sam", "dc", "sgrad", "sdir", "ns_l1", "srf_region",
-            "shadow_sam", "ref_dir",
-            "w_l1", "w_sam", "w_dc", "w_sgrad", "w_sdir", "w_ns_l1", "w_srf_region", "w_shadow_sam", "w_ref_dir",
+            "epoch", "train_loss_total", "loss", "stage_loss", "l1", "sam", "dc", "sgrad", "sdir", "ns_l1", "srf_region",
+            "shadow_sam", "stage_shadow_sam", "ref_dir", "stage_count",
+            "w_l1", "w_sam", "w_dc", "w_sgrad", "w_sdir", "w_ns_l1", "w_srf_region",
+            "w_shadow_sam", "w_ref_dir", "w_stage_loss",
             "PSNR", "RMSE", "SAM", "ERGAS", "SSIM", "CC",
             "checkpoint_score", "best_score", "best_psnr", "best_sam",
         ],
@@ -343,6 +371,7 @@ def main():
                         "best_sam": best_sam,
                         "score_formula": f"PSNR - {cfg.score_sam_weight} * SAM",
                         "loss_weights": get_loss_weights(epoch, cfg),
+                        "lambda_stage_loss": cfg.lambda_stage_loss,
                     },
                 )
 
@@ -361,6 +390,7 @@ def main():
                     "best_sam": best_sam,
                     "score_formula": f"PSNR - {cfg.score_sam_weight} * SAM",
                     "loss_weights": get_loss_weights(epoch, cfg),
+                    "lambda_stage_loss": cfg.lambda_stage_loss,
                 },
             )
 
@@ -368,8 +398,9 @@ def main():
         msg += (
             f" | w: L1={train_metrics['w_l1']:.2f}, SAM={train_metrics['w_sam']:.2f}, "
             f"DC={train_metrics['w_dc']:.2f}, NS={train_metrics['w_ns_l1']:.2f}, "
-            f"ShSAM={train_metrics['w_shadow_sam']:.2f}"
+            f"Stage={train_metrics['w_stage_loss']:.2f}, ShSAM={train_metrics['w_shadow_sam']:.2f}"
         )
+        msg += f" | stage_loss={train_metrics.get('stage_loss', 0.0):.6f}"
         if eval_metrics:
             msg += (
                 f" | PSNR={eval_metrics['PSNR']:.4f} RMSE={eval_metrics['RMSE']:.6f} "
@@ -405,6 +436,7 @@ def main():
             "best_sam": best_sam,
             "score_formula": f"PSNR - {cfg.score_sam_weight} * SAM",
             "loss_weights": get_loss_weights(cfg.epochs, cfg),
+            "lambda_stage_loss": cfg.lambda_stage_loss,
         },
     )
     write_log(
