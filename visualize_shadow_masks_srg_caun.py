@@ -15,6 +15,12 @@ import argparse
 import os
 from typing import Tuple
 
+# 必须在导入 pyplot 之前设置无界面后端，避免服务器/SSH 环境触发 Qt xcb 报错。
+os.environ.setdefault("MPLBACKEND", "Agg")
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+import matplotlib
+matplotlib.use("Agg", force=True)
 import matplotlib.pyplot as plt
 import torch
 
