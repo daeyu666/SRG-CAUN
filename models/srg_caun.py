@@ -95,23 +95,19 @@ class SpectralProjector(nn.Module):
 class InitialReconstruction(nn.Module):
     """初始重建模块。
 
-    修改点：HR-MSI 不再先扩展到 HSI 通道数，直接与 LR-HSI 上采样结果拼接。
-    这样避免初始阶段用 SRF 转置投影产生过强的伪光谱提示。
+    诊断结果显示，原始 LR-HSI 与 HR-MSI 拼接的初始重建会提高 PSNR 但显著恶化 SAM。
+    当前版本只采用 LR-HSI bicubic 上采样作为初始解，不在初始化阶段注入 HR-MSI。
+    HR-MSI 约束留给后续物理一致性更新和展开阶段处理。
     """
 
     def __init__(self, n_bands: int, n_msi_bands: int, hidden_dim: int, scale_ratio: int, srf_weights=None):
         super().__init__()
         self.scale_ratio = scale_ratio
-        self.in_proj = nn.Conv2d(n_bands + n_msi_bands, hidden_dim, 3, padding=1)
-        self.body = ResidualStack(hidden_dim, depth=2)
-        self.out_proj = nn.Conv2d(hidden_dim, n_bands, 3, padding=1)
 
     def forward(self, lr_hsi: torch.Tensor, hr_msi: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         target_size = hr_msi.shape[-2:]
         lr_up = F.interpolate(lr_hsi, size=target_size, mode="bicubic", align_corners=False)
-        feat = torch.cat([lr_up, hr_msi], dim=1)
-        feat = self.body(self.in_proj(feat))
-        pred = torch.clamp(lr_up + self.out_proj(feat), 0.0, 1.0)
+        pred = torch.clamp(lr_up, 0.0, 1.0)
         return pred, lr_up, hr_msi
 
 
@@ -163,7 +159,6 @@ class ShadowReliabilityEstimator(nn.Module):
         out = torch.sigmoid(self.net(x))
 
         learned_reliability = out[:, 0:1]
-        # 低反射率先验：不把所有暗像素硬判为阴影，但给低模长、低 MSI 亮度区域明确更高风险。
         prior_reliability = torch.clamp(0.60 * spectral_norm + 0.40 * msi_intensity, 0.0, 1.0)
         reliability = torch.clamp(0.35 * learned_reliability + 0.65 * prior_reliability, 0.0, 1.0)
         shadow_risk = 1.0 - reliability
@@ -394,6 +389,7 @@ class SRGCAUN(nn.Module):
 
     def forward(self, lr_hsi: torch.Tensor, hr_msi: torch.Tensor, return_aux: bool = False):
         z, lr_up, msi_raw = self.initial(lr_hsi, hr_msi)
+        initial_z = z
         pred_lr_up = F.interpolate(
             F.interpolate(z, size=lr_hsi.shape[-2:], mode="bicubic", align_corners=False),
             size=z.shape[-2:],
@@ -406,8 +402,10 @@ class SRGCAUN(nn.Module):
         reliability_info = self.reliability_estimator(z, hr_msi, lr_residual_proxy, msi_residual_lift)
         reliability = reliability_info["reliability"]
         stage_infos: List[Dict[str, torch.Tensor]] = []
+        stage_outputs: List[torch.Tensor] = []
         for stage in self.stages:
             z, info = stage(z, lr_hsi, hr_msi, reliability)
+            stage_outputs.append(z)
             msi_residual = self.projector.hsi_to_msi(z) - hr_msi
             msi_residual_lift = self.projector.msi_to_hsi(msi_residual)
             reliability_info = self.reliability_estimator(z, hr_msi, lr_residual_proxy, msi_residual_lift)
@@ -415,7 +413,7 @@ class SRGCAUN(nn.Module):
             stage_infos.append(info)
         out = torch.clamp(z + self.final_head(z), 0.0, 1.0)
         aux = {
-            "initial": z.detach(),
+            "initial": initial_z.detach(),
             "lr_up": lr_up.detach(),
             "msi_raw": msi_raw.detach(),
             "reliability": reliability.detach(),
@@ -424,8 +422,11 @@ class SRGCAUN(nn.Module):
             "prior_reliability": reliability_info.get("prior_reliability", reliability).detach(),
             "prior_shadow_risk": reliability_info.get("prior_shadow_risk", 1.0 - reliability).detach(),
             "stage_infos": stage_infos,
+            "stage_outputs": stage_outputs,
         }
-        self.latest_aux = aux
+        latest_aux = dict(aux)
+        latest_aux["stage_outputs"] = [stage_out.detach() for stage_out in stage_outputs]
+        self.latest_aux = latest_aux
         if return_aux:
             return out, aux
         return out
