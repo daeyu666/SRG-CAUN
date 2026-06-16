@@ -1,32 +1,79 @@
 # train_srg_caun_hier_match.py
-"""Train / test entry for SRG-CAUN hierarchical coarse-to-fine matching variant."""
+"""Standalone train / test entry for SRG-CAUN hierarchical matching variant."""
 
 from __future__ import annotations
 
 import argparse
 import os
 
+import torch
+import torch.nn as nn
 from torch.optim import AdamW
 
 from config import parse_args, print_config
 from data_loader import build_loaders
+from losses import BaseHSRLoss
+from metrics import MetricAverager, calc_metrics
 from models import build_srg_caun_hier_match
-from train_srg_caun import (
-    build_criterion,
-    calc_checkpoint_score,
-    evaluate,
-    get_loss_weights,
-    train_one_epoch,
-)
 from utils import (
     CSVLogger,
     count_parameters,
     get_device,
     load_checkpoint,
+    move_to_device,
     save_checkpoint,
     set_seed,
     write_log,
 )
+
+
+class ShadowWeightedSAMLoss(nn.Module):
+    """SAM loss weighted by the model shadow-risk map."""
+
+    def __init__(self, weight_scale: float = 2.0, eps: float = 1e-8):
+        super().__init__()
+        self.weight_scale = weight_scale
+        self.eps = eps
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor, shadow_risk: torch.Tensor = None) -> torch.Tensor:
+        dot = torch.sum(pred * target, dim=1)
+        pred_norm = torch.sqrt(torch.sum(pred * pred, dim=1) + self.eps)
+        target_norm = torch.sqrt(torch.sum(target * target, dim=1) + self.eps)
+        cos = dot / (pred_norm * target_norm + self.eps)
+        cos = torch.clamp(cos, -1.0 + self.eps, 1.0 - self.eps)
+        angle = torch.acos(cos)
+
+        if shadow_risk is None:
+            return angle.mean()
+
+        weight = 1.0 + self.weight_scale * shadow_risk.squeeze(1).detach()
+        return torch.mean(angle * weight)
+
+
+class ReferenceDirectionLoss(nn.Module):
+    """Keep the reference branch as a directional correction in low-reliability areas."""
+
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, model) -> torch.Tensor:
+        aux = getattr(model, "latest_aux", {})
+        stage_infos = aux.get("stage_infos", [])
+        if not stage_infos:
+            return next(model.parameters()).new_tensor(0.0)
+
+        losses = []
+        for info in stage_infos:
+            ref = info.get("ref_residual", None)
+            reliability = info.get("reliability", None)
+            if ref is None or reliability is None:
+                continue
+            shadow = 1.0 - reliability.detach()
+            losses.append(torch.mean(torch.abs(ref) * shadow))
+
+        if not losses:
+            return next(model.parameters()).new_tensor(0.0)
+        return sum(losses) / len(losses)
 
 
 def parse_hier_args():
@@ -53,6 +100,175 @@ def parse_hier_args():
     for key, value in vars(args).items():
         setattr(cfg, key, value)
     return cfg
+
+
+def build_criterion(cfg, info):
+    srf_weights = info.get("srf_weights", None)
+    base = BaseHSRLoss(
+        scale_ratio=cfg.scale_ratio,
+        n_select_bands=info["n_select_bands"],
+        lambda_l1=cfg.lambda_l1,
+        lambda_sam=cfg.lambda_sam,
+        lambda_dc=cfg.lambda_dc,
+        lambda_sgrad=cfg.lambda_sgrad,
+        lambda_sdir=cfg.lambda_sdir,
+        lambda_ns_l1=cfg.lambda_ns_l1,
+        lambda_srf_region=cfg.lambda_srf_region,
+        srf_weights=srf_weights,
+    )
+    shadow_sam = ShadowWeightedSAMLoss(weight_scale=2.0)
+    ref_dir = ReferenceDirectionLoss()
+    return base, shadow_sam, ref_dir
+
+
+def get_loss_weights(epoch: int, cfg) -> dict:
+    if getattr(cfg, "loss_schedule", "warmup") == "off":
+        return {
+            "l1": cfg.lambda_l1,
+            "sam": cfg.lambda_sam,
+            "dc": cfg.lambda_dc,
+            "sgrad": cfg.lambda_sgrad,
+            "sdir": cfg.lambda_sdir,
+            "ns_l1": cfg.lambda_ns_l1,
+            "srf_region": cfg.lambda_srf_region,
+            "shadow_sam": cfg.lambda_shadow_sam,
+            "ref_dir": cfg.lambda_ref_dir,
+        }
+
+    if epoch <= cfg.phase1_epochs:
+        return {
+            "l1": 1.0,
+            "sam": 0.05,
+            "dc": 0.10,
+            "sgrad": 0.0,
+            "sdir": 0.0,
+            "ns_l1": 0.30,
+            "srf_region": 0.0,
+            "shadow_sam": 0.0,
+            "ref_dir": 0.0,
+        }
+
+    if epoch <= cfg.phase2_epochs:
+        return {
+            "l1": 1.0,
+            "sam": 0.05,
+            "dc": 0.10,
+            "sgrad": 0.02,
+            "sdir": 0.05,
+            "ns_l1": 0.30,
+            "srf_region": 0.10,
+            "shadow_sam": 0.0,
+            "ref_dir": 0.0,
+        }
+
+    return {
+        "l1": 1.0,
+        "sam": 0.05,
+        "dc": 0.10,
+        "sgrad": 0.02,
+        "sdir": 0.05,
+        "ns_l1": 0.30,
+        "srf_region": 0.10,
+        "shadow_sam": 0.05,
+        "ref_dir": 0.01,
+    }
+
+
+def apply_base_loss_weights(base_loss: BaseHSRLoss, weights: dict):
+    base_loss.lambda_l1 = weights["l1"]
+    base_loss.lambda_sam = weights["sam"]
+    base_loss.lambda_dc = weights["dc"]
+    base_loss.lambda_sgrad = weights["sgrad"]
+    base_loss.lambda_sdir = weights["sdir"]
+    base_loss.lambda_ns_l1 = weights["ns_l1"]
+    base_loss.lambda_srf_region = weights["srf_region"]
+
+
+def calc_checkpoint_score(eval_metrics, cfg):
+    psnr = float(eval_metrics.get("PSNR", -1.0))
+    sam = float(eval_metrics.get("SAM", 1e6))
+    return psnr - float(cfg.score_sam_weight) * sam
+
+
+def average_tensors(values, fallback: torch.Tensor) -> torch.Tensor:
+    if not values:
+        return fallback
+    return sum(values) / len(values)
+
+
+def train_one_epoch(model, loader, optimizer, base_loss, shadow_sam_loss, ref_dir_loss, cfg, device, epoch: int):
+    model.train()
+    meter = MetricAverager()
+    total_loss = 0.0
+
+    loss_weights = get_loss_weights(epoch, cfg)
+    apply_base_loss_weights(base_loss, loss_weights)
+
+    for batch in loader:
+        batch = move_to_device(batch, device)
+        lr_hsi = batch["lr_hsi"]
+        hr_msi = batch["hr_msi"]
+        gt = batch["gt"]
+
+        optimizer.zero_grad(set_to_none=True)
+        pred, aux = model(lr_hsi, hr_msi, return_aux=True)
+        loss_final, loss_dict = base_loss(pred, gt, lr_hsi, hr_msi)
+
+        zero = pred.new_tensor(0.0)
+        stage_outputs = aux.get("stage_outputs", [])
+        stage_base_losses = []
+        stage_shadow_losses = []
+        for stage_pred in stage_outputs:
+            stage_loss, _ = base_loss(stage_pred, gt, lr_hsi, hr_msi)
+            stage_base_losses.append(stage_loss)
+            stage_shadow_losses.append(shadow_sam_loss(stage_pred, gt, aux.get("shadow_risk", None)))
+
+        loss_stage = average_tensors(stage_base_losses, zero)
+        loss_stage_shadow = average_tensors(stage_shadow_losses, zero)
+        loss_shadow = shadow_sam_loss(pred, gt, aux.get("shadow_risk", None))
+        loss_ref = ref_dir_loss(model)
+
+        stage_weight = float(getattr(cfg, "lambda_stage_loss", 1.0))
+        loss = (
+            loss_final
+            + stage_weight * loss_stage
+            + loss_weights["shadow_sam"] * (loss_shadow + stage_weight * loss_stage_shadow)
+            + loss_weights["ref_dir"] * loss_ref
+        )
+
+        loss.backward()
+        if cfg.grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+        optimizer.step()
+
+        total_loss += float(loss.item())
+        metrics = {k: float(v.item()) for k, v in loss_dict.items()}
+        metrics["stage_loss"] = float(loss_stage.detach().item())
+        metrics["stage_shadow_sam"] = float(loss_stage_shadow.detach().item())
+        metrics["shadow_sam"] = float(loss_shadow.detach().item())
+        metrics["ref_dir"] = float(loss_ref.detach().item())
+        metrics["stage_count"] = float(len(stage_outputs))
+        meter.update(metrics)
+
+    avg = meter.average()
+    avg["train_loss_total"] = total_loss / max(len(loader), 1)
+    for key, value in loss_weights.items():
+        avg[f"w_{key}"] = value
+    avg["w_stage_loss"] = float(getattr(cfg, "lambda_stage_loss", 1.0))
+    return avg
+
+
+@torch.no_grad()
+def evaluate(model, loader, cfg, device):
+    model.eval()
+    meter = MetricAverager()
+    for batch in loader:
+        batch = move_to_device(batch, device)
+        pred = model(batch["lr_hsi"], batch["hr_msi"])
+        pred = torch.clamp(pred, 0.0, 1.0)
+        metrics = calc_metrics(pred, batch["gt"], cfg.scale_ratio)
+        meter.update(metrics)
+    return meter.average()
 
 
 def main():
@@ -123,9 +339,7 @@ def main():
     )
 
     for epoch in range(start_epoch, cfg.epochs + 1):
-        train_metrics = train_one_epoch(
-            model, train_loader, optimizer, base_loss, shadow_sam_loss, ref_dir_loss, cfg, device, epoch
-        )
+        train_metrics = train_one_epoch(model, train_loader, optimizer, base_loss, shadow_sam_loss, ref_dir_loss, cfg, device, epoch)
 
         eval_metrics = {}
         checkpoint_score = ""
@@ -225,8 +439,7 @@ def main():
     )
     write_log(
         log_path,
-        f"Training finished. Best score={best_score:.4f}, best PSNR={best_psnr:.4f}, "
-        f"best SAM={best_sam:.4f}. Best checkpoint: {best_path}",
+        f"Training finished. Best score={best_score:.4f}, best PSNR={best_psnr:.4f}, best SAM={best_sam:.4f}. Best checkpoint: {best_path}",
     )
 
 
