@@ -132,6 +132,7 @@ class DRTBaseline(nn.Module):
             ResidualBlock(cfg.hidden_dim),
             nn.Conv2d(cfg.hidden_dim, cfg.n_bands, 3, padding=1),
         )
+        self.conv_spe = nn.Conv2d(cfg.n_bands, cfg.n_bands, 3, padding=1)
         self.latest_aux: Dict[str, torch.Tensor] = {}
 
     @staticmethod
@@ -140,6 +141,10 @@ class DRTBaseline(nn.Module):
         if h <= target_size or w <= target_size:
             return F.interpolate(x, size=(target_size, target_size), mode="bilinear", align_corners=False)
         return F.adaptive_avg_pool2d(x, output_size=(target_size, target_size))
+
+    def spectral_reconstruction(self, pred: torch.Tensor) -> torch.Tensor:
+        """DRT paper spectral reconstruction branch: Ispe = Iout + Convspe(3, Iout)."""
+        return pred + self.conv_spe(pred)
 
     def forward(self, lr_hsi: torch.Tensor, hr_msi: torch.Tensor, return_aux: bool = False):
         target_size = hr_msi.shape[-2:]
