@@ -12,8 +12,6 @@ from config import parse_args, print_config
 from data_loader import build_loaders
 from models import build_srg_caun_hier_match
 from train_srg_caun import (
-    apply_base_loss_weights,
-    average_tensors,
     build_criterion,
     calc_checkpoint_score,
     evaluate,
