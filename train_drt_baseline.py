@@ -7,11 +7,12 @@ import argparse
 import os
 
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from torch.optim import AdamW
 
 from config import parse_args, print_config
 from data_loader import build_loaders
-from losses import BaseHSRLoss
 from metrics import MetricAverager, calc_metrics
 from models import build_drt_baseline
 from utils import (
@@ -26,16 +27,42 @@ from utils import (
 )
 
 
+class DRTPaperLoss(nn.Module):
+    """DRT-Net paper loss without the removed contrastive term.
+
+    Paper total loss: Ltotal = Lmse + Lspe + Lc.
+    This baseline removes contrastive learning, so Lc is fixed to 0 and the
+    optimized reconstruction loss is Lmse + Lspe.
+    """
+
+    def __init__(self, lambda_mse: float = 1.0, lambda_spe: float = 1.0):
+        super().__init__()
+        self.lambda_mse = lambda_mse
+        self.lambda_spe = lambda_spe
+
+    def forward(self, pred: torch.Tensor, gt: torch.Tensor, model: nn.Module):
+        loss_mse = 0.5 * F.mse_loss(pred, gt)
+        pred_spe = model.spectral_reconstruction(pred)
+        loss_spe = 0.5 * F.mse_loss(pred_spe, pred)
+        loss_contrast = pred.new_tensor(0.0)
+        loss = self.lambda_mse * loss_mse + self.lambda_spe * loss_spe + loss_contrast
+        return loss, {
+            "loss": loss.detach(),
+            "mse": loss_mse.detach(),
+            "spe": loss_spe.detach(),
+            "contrast": loss_contrast.detach(),
+        }
+
+
 def parse_drt_args():
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--hidden_dim", type=int, default=48)
     parser.add_argument("--depth", type=int, default=2)
     parser.add_argument("--heads", type=int, default=4)
     parser.add_argument("--dropout", type=float, default=0.0)
+    parser.add_argument("--lambda_spe", type=float, default=1.0)
     parser.add_argument("--score_sam_weight", type=float, default=1.0)
     parser.add_argument("--grad_clip", type=float, default=1.0)
-    parser.add_argument("--loss_schedule", type=str, default="off", choices=["off", "warmup"])
-    parser.add_argument("--phase1_epochs", type=int, default=50)
     args, remaining = parser.parse_known_args()
 
     cfg = parse_args(remaining)
@@ -44,52 +71,11 @@ def parse_drt_args():
     return cfg
 
 
-def build_criterion(cfg, info):
-    return BaseHSRLoss(
-        scale_ratio=cfg.scale_ratio,
-        n_select_bands=info["n_select_bands"],
-        lambda_l1=cfg.lambda_l1,
-        lambda_sam=cfg.lambda_sam,
-        lambda_dc=cfg.lambda_dc,
-        lambda_sgrad=cfg.lambda_sgrad,
-        lambda_sdir=cfg.lambda_sdir,
-        lambda_ns_l1=cfg.lambda_ns_l1,
-        lambda_srf_region=cfg.lambda_srf_region,
-        srf_weights=info.get("srf_weights", None),
+def build_criterion(cfg):
+    return DRTPaperLoss(
+        lambda_mse=float(getattr(cfg, "lambda_mse", 1.0)),
+        lambda_spe=float(getattr(cfg, "lambda_spe", 1.0)),
     )
-
-
-def get_loss_weights(epoch: int, cfg) -> dict:
-    if getattr(cfg, "loss_schedule", "off") == "warmup" and epoch <= cfg.phase1_epochs:
-        return {
-            "l1": 1.0,
-            "sam": 0.05,
-            "dc": 0.10,
-            "sgrad": 0.0,
-            "sdir": 0.0,
-            "ns_l1": 0.30,
-            "srf_region": 0.0,
-        }
-
-    return {
-        "l1": cfg.lambda_l1,
-        "sam": cfg.lambda_sam,
-        "dc": cfg.lambda_dc,
-        "sgrad": cfg.lambda_sgrad,
-        "sdir": cfg.lambda_sdir,
-        "ns_l1": cfg.lambda_ns_l1,
-        "srf_region": cfg.lambda_srf_region,
-    }
-
-
-def apply_base_loss_weights(base_loss: BaseHSRLoss, weights: dict):
-    base_loss.lambda_l1 = weights["l1"]
-    base_loss.lambda_sam = weights["sam"]
-    base_loss.lambda_dc = weights["dc"]
-    base_loss.lambda_sgrad = weights["sgrad"]
-    base_loss.lambda_sdir = weights["sdir"]
-    base_loss.lambda_ns_l1 = weights["ns_l1"]
-    base_loss.lambda_srf_region = weights["srf_region"]
 
 
 def calc_checkpoint_score(eval_metrics, cfg):
@@ -98,13 +84,10 @@ def calc_checkpoint_score(eval_metrics, cfg):
     return psnr - float(cfg.score_sam_weight) * sam
 
 
-def train_one_epoch(model, loader, optimizer, base_loss, cfg, device, epoch: int):
+def train_one_epoch(model, loader, optimizer, criterion, cfg, device, epoch: int):
     model.train()
     meter = MetricAverager()
     total_loss = 0.0
-
-    loss_weights = get_loss_weights(epoch, cfg)
-    apply_base_loss_weights(base_loss, loss_weights)
 
     for batch in loader:
         batch = move_to_device(batch, device)
@@ -114,7 +97,7 @@ def train_one_epoch(model, loader, optimizer, base_loss, cfg, device, epoch: int
 
         optimizer.zero_grad(set_to_none=True)
         pred = model(lr_hsi, hr_msi)
-        loss, loss_dict = base_loss(pred, gt, lr_hsi, hr_msi)
+        loss, loss_dict = criterion(pred, gt, model)
         loss.backward()
         if cfg.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
@@ -125,8 +108,8 @@ def train_one_epoch(model, loader, optimizer, base_loss, cfg, device, epoch: int
 
     avg = meter.average()
     avg["train_loss_total"] = total_loss / max(len(loader), 1)
-    for key, value in loss_weights.items():
-        avg[f"w_{key}"] = value
+    avg["w_mse"] = float(getattr(cfg, "lambda_mse", 1.0))
+    avg["w_spe"] = float(getattr(cfg, "lambda_spe", 1.0))
     return avg
 
 
@@ -161,8 +144,8 @@ def main():
         srf_weights=info.get("srf_weights", None),
     ).to(device)
 
+    criterion = build_criterion(cfg).to(device)
     optimizer = AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-    base_loss = build_criterion(cfg, info).to(device)
 
     save_name = cfg.save_name or f"{cfg.dataset}_drt_baseline.pth"
     ckpt_dir = os.path.join(cfg.checkpoint_root, "drt_baseline")
@@ -189,21 +172,21 @@ def main():
     write_log(log_path, f"Model parameters: {count_parameters(model):.3f} M")
     write_log(log_path, f"Dataset info: {info}")
     write_log(log_path, "Model: DRT baseline without rectangular transformer, SAFA multiscale aggregation, or contrastive learning.")
+    write_log(log_path, "Loss: DRT paper loss Ltotal = Lmse + Lspe + Lc, with Lc=0 because contrastive learning is removed.")
+    write_log(log_path, f"Loss weights: lambda_mse={getattr(cfg, 'lambda_mse', 1.0):.3f}, lambda_spe={cfg.lambda_spe:.3f}")
     write_log(log_path, f"Checkpoint score: PSNR - {cfg.score_sam_weight:.3f} * SAM")
-    write_log(log_path, f"Loss schedule: {cfg.loss_schedule}, phase1={cfg.phase1_epochs}")
 
     csv_logger = CSVLogger(
         csv_path,
         fieldnames=[
-            "epoch", "train_loss_total", "loss", "l1", "sam", "dc", "sgrad", "sdir", "ns_l1", "srf_region",
-            "w_l1", "w_sam", "w_dc", "w_sgrad", "w_sdir", "w_ns_l1", "w_srf_region",
+            "epoch", "train_loss_total", "loss", "mse", "spe", "contrast", "w_mse", "w_spe",
             "PSNR", "RMSE", "SAM", "ERGAS", "SSIM", "CC",
             "checkpoint_score", "best_score", "best_psnr", "best_sam",
         ],
     )
 
     for epoch in range(start_epoch, cfg.epochs + 1):
-        train_metrics = train_one_epoch(model, train_loader, optimizer, base_loss, cfg, device, epoch)
+        train_metrics = train_one_epoch(model, train_loader, optimizer, criterion, cfg, device, epoch)
 
         eval_metrics = {}
         checkpoint_score = ""
@@ -229,7 +212,7 @@ def main():
                         "best_psnr": best_psnr,
                         "best_sam": best_sam,
                         "score_formula": f"PSNR - {cfg.score_sam_weight} * SAM",
-                        "loss_weights": get_loss_weights(epoch, cfg),
+                        "loss_formula": "Lmse + Lspe + Lc, Lc=0 for no-contrast baseline",
                     },
                 )
 
@@ -247,14 +230,15 @@ def main():
                     "best_psnr": best_psnr,
                     "best_sam": best_sam,
                     "score_formula": f"PSNR - {cfg.score_sam_weight} * SAM",
-                    "loss_weights": get_loss_weights(epoch, cfg),
+                    "loss_formula": "Lmse + Lspe + Lc, Lc=0 for no-contrast baseline",
                 },
             )
 
         msg = f"Epoch {epoch:04d}/{cfg.epochs} | train_loss={train_metrics['train_loss_total']:.6f}"
         msg += (
-            f" | w: L1={train_metrics['w_l1']:.2f}, SAM={train_metrics['w_sam']:.2f}, "
-            f"DC={train_metrics['w_dc']:.2f}, NS={train_metrics['w_ns_l1']:.2f}"
+            f" | mse={train_metrics.get('mse', 0.0):.6f}, "
+            f"spe={train_metrics.get('spe', 0.0):.6f}, "
+            f"contrast={train_metrics.get('contrast', 0.0):.6f}"
         )
         if eval_metrics:
             msg += (
@@ -290,7 +274,7 @@ def main():
             "best_psnr": best_psnr,
             "best_sam": best_sam,
             "score_formula": f"PSNR - {cfg.score_sam_weight} * SAM",
-            "loss_weights": get_loss_weights(cfg.epochs, cfg),
+            "loss_formula": "Lmse + Lspe + Lc, Lc=0 for no-contrast baseline",
         },
     )
     write_log(
