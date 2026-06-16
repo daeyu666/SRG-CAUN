@@ -63,6 +63,10 @@ def parse_drt_args():
     parser.add_argument("--lambda_spe", type=float, default=1.0)
     parser.add_argument("--score_sam_weight", type=float, default=1.0)
     parser.add_argument("--grad_clip", type=float, default=1.0)
+    parser.add_argument("--loss_schedule", type=str, default="off", choices=["off", "warmup"],
+                        help="Accepted for compatibility; DRT paper loss does not use a schedule.")
+    parser.add_argument("--phase1_epochs", type=int, default=50,
+                        help="Accepted for compatibility; DRT paper loss does not use phases.")
     args, remaining = parser.parse_known_args()
 
     cfg = parse_args(remaining)
